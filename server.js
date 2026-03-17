@@ -93,6 +93,37 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
+// ✅ GET USER PROJECTS
+app.get("/projects/:user_id", async (req, res) => {
+  try {
+    const { user_id } = req.params;
+
+    const { data, error } = await supabase
+      .from("projects")
+      .select("*")
+      .eq("user_id", user_id)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      return res.status(500).json({
+        success: false,
+        message: "Fetch failed",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      projects: data,
+    });
+
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({
+      success: false,
+    });
+  }
+});
+
 app.listen(5000, () => {
   console.log("Server running on port 5000");
 }); 
