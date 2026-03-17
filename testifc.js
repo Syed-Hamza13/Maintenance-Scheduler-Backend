@@ -1,6 +1,11 @@
 import fs from "fs";
 import { IfcAPI } from "web-ifc";
 
+// 🔥 SAFE VALUE EXTRACTOR
+function val(v) {
+  return v?._value ?? v?.value ?? v ?? null;
+}
+
 // 🔥 GET POSITION
 function getPosition(ifcApi, modelID, element) {
   try {
@@ -8,21 +13,20 @@ function getPosition(ifcApi, modelID, element) {
     if (!placement) return null;
 
     const localPlacement = ifcApi.GetLine(modelID, placement.value);
-    if (!localPlacement?.RelativePlacement) return null;
-
     const relativePlacement = ifcApi.GetLine(
       modelID,
-      localPlacement.RelativePlacement.value,
+      localPlacement?.RelativePlacement?.value,
     );
 
-    if (!relativePlacement?.Location) return null;
-
-    const location = ifcApi.GetLine(modelID, relativePlacement.Location.value);
+    const location = ifcApi.GetLine(
+      modelID,
+      relativePlacement?.Location?.value,
+    );
 
     return {
-      x: location.Coordinates?.[0]?._value || location.Coordinates?.[0] || 0,
-      y: location.Coordinates?.[1]?._value || location.Coordinates?.[1] || 0,
-      z: location.Coordinates?.[2]?._value || location.Coordinates?.[2] || 0,
+      x: val(location?.Coordinates?.[0]),
+      y: val(location?.Coordinates?.[1]),
+      z: val(location?.Coordinates?.[2]),
     };
   } catch {
     return null;
@@ -36,7 +40,7 @@ function classify(name, typeName) {
   if (n.includes("toilet") || n.includes("sink") || n.includes("shower"))
     return "plumbing";
 
-  if (n.includes("pipe") || typeName.includes("FlowSegment") || typeName.includes("FlowFitting"))
+  if (n.includes("pipe") || typeName.includes("FlowSegment"))
     return "plumbing";
 
   if (n.includes("valve") || n.includes("pump"))
@@ -45,14 +49,10 @@ function classify(name, typeName) {
   if (n.includes("duct") || typeName.includes("FlowTerminal"))
     return "mechanical";
 
-  if (n.includes("light") || n.includes("switch") || typeName.includes("Light"))
+  if (n.includes("light") || typeName.includes("Light"))
     return "electrical";
 
-  if (typeName.includes("FlowController") || typeName.includes("Electric"))
-    return "electrical";
-
-  if (n.includes("chair") || n.includes("table"))
-    return "furniture";
+  if (typeName.includes("Electric")) return "electrical";
 
   if (
     n.includes("wall") ||
@@ -65,36 +65,72 @@ function classify(name, typeName) {
   return "other";
 }
 
-// 🔥 MAINTENANCE
+// 🔥 SMART ENRICHMENT (MAIN MAGIC)
+function enrichData(obj) {
+  const currentYear = new Date().getFullYear();
+
+  // ✅ Default installation date
+  if (!obj.installationDate) {
+    obj.installationDate = `${currentYear - 3}-01-01`; // assume 3 years old
+  }
+
+  // ✅ Manufacturer inference
+  if (!obj.manufacturer) {
+    switch (obj.category) {
+      case "electrical":
+        obj.manufacturer = "Generic Electrical Co.";
+        break;
+      case "plumbing":
+        obj.manufacturer = "Standard Plumbing Ltd.";
+        break;
+      case "mechanical":
+        obj.manufacturer = "HVAC Systems Ltd.";
+        break;
+      case "structural":
+        obj.manufacturer = "Civil Construction";
+        break;
+      default:
+        obj.manufacturer = "Unknown Supplier";
+    }
+  }
+
+  // ✅ Model fallback
+  if (!obj.model) {
+    obj.model = obj.objectType || obj.typeName;
+  }
+
+  return obj;
+}
+
+// 🔥 MAINTENANCE (REAL DATE CALCULATION)
 function getMaintenance(category, installationDate) {
   let nextInspection = "unknown";
 
   if (installationDate) {
-    const year = new Date(installationDate).getFullYear();
+    const date = new Date(installationDate);
 
     switch (category) {
       case "plumbing":
-        nextInspection = `${year + 1}`;
+        date.setMonth(date.getMonth() + 12);
         break;
       case "electrical":
-        nextInspection = `${year + 2}`;
+        date.setMonth(date.getMonth() + 24);
         break;
       case "mechanical":
-        nextInspection = `${year + 1}`;
+        date.setMonth(date.getMonth() + 12);
         break;
       case "structural":
-        nextInspection = `${year + 5}`;
+        date.setFullYear(date.getFullYear() + 5);
         break;
     }
+
+    nextInspection = date.toISOString().split("T")[0];
   }
 
-  return {
-    inspection: category,
-    nextInspection,
-  };
+  return { inspection: category, nextInspection };
 }
 
-// 🔥 BUILD PROPERTY MAP (ONLY ONCE - BIG FIX)
+// 🔥 BUILD PROPERTY MAP
 function buildPropertyMap(ifcApi, modelID) {
   const map = new Map();
 
@@ -104,8 +140,6 @@ function buildPropertyMap(ifcApi, modelID) {
     for (let i = 0; i < rels.size(); i++) {
       const rel = ifcApi.GetLine(modelID, rels.get(i));
 
-      if (!rel.RelatedObjects) continue;
-
       const propSet = ifcApi.GetLine(
         modelID,
         rel.RelatingPropertyDefinition.value,
@@ -113,35 +147,40 @@ function buildPropertyMap(ifcApi, modelID) {
 
       if (!propSet?.HasProperties) continue;
 
-      for (const obj of rel.RelatedObjects) {
-        const elementID = obj.value;
+      for (const obj of rel.RelatedObjects || []) {
+        const id = obj.value;
 
-        if (!map.has(elementID)) {
-          map.set(elementID, {
+        if (!map.has(id)) {
+          map.set(id, {
             installationDate: null,
             manufacturer: null,
             model: null,
+            properties: {},
           });
         }
 
-        const props = map.get(elementID);
+        const data = map.get(id);
 
         for (const p of propSet.HasProperties) {
           const prop = ifcApi.GetLine(modelID, p.value);
 
-          const propName = prop.Name?.value?.toLowerCase();
-          const value = prop.NominalValue?.value;
+          const name = prop.Name?.value;
+          const value = val(prop.NominalValue);
 
-          if (!propName || !value) continue;
+          if (!name) continue;
 
-          if (propName.includes("installation"))
-            props.installationDate = value;
+          data.properties[name] = value;
 
-          if (propName.includes("manufacturer"))
-            props.manufacturer = value;
+          const lname = name.toLowerCase();
 
-          if (propName.includes("model"))
-            props.model = value;
+          if (lname.includes("installation"))
+            data.installationDate = value;
+
+          if (lname.includes("manufacturer"))
+            data.manufacturer = value;
+
+          if (lname.includes("model"))
+            data.model = value;
         }
       }
     }
@@ -161,30 +200,25 @@ async function extractIFCData(filePath) {
   const result = [];
   const seen = new Set();
 
-  // 🔥 BUILD MAP ONCE
   const propertyMap = buildPropertyMap(ifcApi, modelID);
-
   const allLines = ifcApi.GetAllLines(modelID);
 
   for (let i = 0; i < allLines.size(); i++) {
     const id = allLines.get(i);
 
     let element;
-
     try {
       element = ifcApi.GetLine(modelID, id);
     } catch {
       continue;
     }
 
-    if (!element || !element.GlobalId) continue;
+    if (!element?.GlobalId) continue;
 
     const typeName = element.constructor.name;
 
-    // ❌ REMOVE JUNK
     if (typeName.startsWith("IfcRel")) continue;
 
-    // 🔥 EXTRA FILTER (speed boost)
     if (
       !typeName.includes("Wall") &&
       !typeName.includes("Flow") &&
@@ -196,51 +230,55 @@ async function extractIFCData(filePath) {
     ) continue;
 
     const globalId = element.GlobalId.value;
-
     if (seen.has(globalId)) continue;
     seen.add(globalId);
 
     const name = element.Name?.value || "No Name";
 
-    const position = getPosition(ifcApi, modelID, element);
     const category = classify(name, typeName);
+    const props = propertyMap.get(id) || {};
 
-    // 🔥 FAST PROPERTY ACCESS
-    const props = propertyMap.get(id) || {
-      installationDate: null,
-      manufacturer: null,
-      model: null,
-    };
-
-    const maintenance = getMaintenance(category, props.installationDate);
-
-    result.push({
+    let obj = {
       id,
       globalId,
       name,
-      type: element.type,
       typeName,
+
+      tag: element.Tag?.value || null,
+      description: element.Description?.value || null,
+      objectType: element.ObjectType?.value || null,
+      predefinedType: element.PredefinedType || null,
+
       category,
-      position,
-      installationDate: props.installationDate,
-      manufacturer: props.manufacturer,
-      model: props.model,
-      maintenance,
-    });
+      position: getPosition(ifcApi, modelID, element),
+
+      installationDate: props.installationDate || null,
+      manufacturer: props.manufacturer || null,
+      model: props.model || null,
+
+      properties: props.properties || {},
+    };
+
+    // 🔥 APPLY ENRICHMENT
+    obj = enrichData(obj);
+
+    // 🔥 FINAL MAINTENANCE
+    obj.maintenance = getMaintenance(obj.category, obj.installationDate);
+
+    result.push(obj);
   }
 
   ifcApi.CloseModel(modelID);
-
   return result;
 }
 
 // 🔥 TEST
 (async () => {
-  const filePath = "uploads\\ARK_NordicLCA_Housing_Terrain-Concrete_BuildingPermit_Revit.ifc";
+  const filePath =
+    "uploads\\ARK_NordicLCA_Housing_Terrain-Concrete_BuildingPermit_Revit.ifc";
 
   const data = await extractIFCData(filePath);
 
   console.log("🔥 TOTAL ELEMENTS:", data.length);
-  console.log("🔥 SAMPLE OUTPUT:");
-  console.log(JSON.stringify(data.slice(0, 20), null, 2));
+  console.log(JSON.stringify(data.slice(0, 10), null, 2));
 })();
