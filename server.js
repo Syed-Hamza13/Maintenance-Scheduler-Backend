@@ -1,13 +1,13 @@
 import dotenv from "dotenv";
-
 dotenv.config();
+
 import express from "express";
 import multer from "multer";
 import cors from "cors";
-import path from "path"; 
+import path from "path";
 import { fileURLToPath } from "url";
 import { createClient } from "@supabase/supabase-js";
-
+import { extractIFCData } from "./testifc.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,16 +16,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔥 Supabase setup
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// static files
 app.use("/files", express.static(path.join(__dirname, "uploads")));
 
-// storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, path.join(__dirname, "uploads"));
@@ -37,93 +34,107 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-// ✅ upload route (UPDATED)
+// 🔥 BACKGROUND PROCESS
+async function processIFC(projectId, filePath) {
+  try {
+    console.log("🚀 Processing IFC:", filePath);
+
+    const data = await extractIFCData(filePath);
+
+    await supabase
+      .from("schedules")
+      .update({
+        data: data,
+        status: "ready",
+      })
+      .eq("project_id", projectId);
+
+    console.log("✅ IFC processed");
+  } catch (err) {
+    console.error("❌ IFC ERROR:", err);
+  }
+}
+
+// ✅ UPLOAD
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     const { user_id } = req.body;
 
-    if (!req.file) {
-      return res.status(400).json({
-        success: false, 
-        message: "No file uploaded", 
-      });
-    }
+    const { data: project, error } = await supabase
+      .from("projects")
+      .insert([
+        {
+          user_id,
+          file_name: req.file.originalname,
+          file_path: req.file.filename,
+        },
+      ])
+      .select()
+      .single();
 
-    if (!user_id) {
-      return res.status(400).json({
-        success: false,
-        message: "User ID required",
-      });
-    }
+    if (error) throw error;
 
-    const fileName = req.file.filename;
-
-    console.log("FILE RECEIVED:", fileName);
-
-    // 🔥 SAVE TO DB
-    const { error } = await supabase.from("projects").insert([
+    // 🔥 create processing schedule
+    await supabase.from("schedules").insert([
       {
-        user_id: user_id,
-        file_name: req.file.originalname,
-        file_path: fileName,
+        project_id: project.id,
+        status: "processing",
+        data: null,
       },
     ]);
 
-    if (error) {
-      console.error("DB ERROR:", error);
-      return res.status(500).json({
-        success: false,
-        message: "DB insert failed",
-      });
-    }
+    // async processing
+    processIFC(
+      project.id,
+      path.join(__dirname, "uploads", req.file.filename)
+    );
 
-    return res.status(200).json({
+    res.json({
       success: true,
-      message: "File uploaded & saved",
-      file: fileName,
+      project_id: project.id,
     });
-
-  } catch (err) {
-    console.error("UPLOAD ERROR:", err);
-
-    return res.status(500).json({
-      success: false,
-      message: "Upload failed",
-    });
-  }
-});
-
-// ✅ GET USER PROJECTS
-app.get("/projects/:user_id", async (req, res) => {
-  try {
-    const { user_id } = req.params;
-
-    const { data, error } = await supabase
-      .from("projects")
-      .select("*")
-      .eq("user_id", user_id)
-      .order("created_at", { ascending: false });
-
-    if (error) {
-      return res.status(500).json({
-        success: false,
-        message: "Fetch failed",
-      });
-    }
-
-    return res.status(200).json({
-      success: true,
-      projects: data,
-    });
-
   } catch (err) {
     console.error(err);
-    return res.status(500).json({
-      success: false,
+    res.status(500).json({ success: false });
+  }
+});
+
+// ✅ GET PROJECTS
+app.get("/projects/:user_id", async (req, res) => {
+  const { data } = await supabase
+    .from("projects")
+    .select("*")
+    .eq("user_id", req.params.user_id)
+    .order("created_at", { ascending: false });
+
+  res.json({ success: true, projects: data });
+});
+
+// 🔥 FIXED SCHEDULE API
+app.get("/schedule/:project_id", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("schedules")
+      .select("*")
+      .eq("project_id", req.params.project_id);
+
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
+      return res.json({
+        status: "processing",
+        data: null,
+      });
+    }
+
+    return res.json(data[0]);
+  } catch (err) {
+    console.error(err);
+    res.json({
+      status: "processing",
+      data: null,
     });
   }
 });
 
-app.listen(5000, () => {
-  console.log("Server running on port 5000");
-}); 
+app.listen(5000, () => console.log("Server running"));

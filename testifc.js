@@ -282,3 +282,5 @@ async function extractIFCData(filePath) {
   console.log("🔥 TOTAL ELEMENTS:", data.length);
   console.log(JSON.stringify(data.slice(0, 10), null, 2));
 })();
+
+export { extractIFCData };
